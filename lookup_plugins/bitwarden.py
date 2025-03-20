@@ -65,9 +65,9 @@ RETURN = """
 
 
 class Bitwarden(object):
-    def __init__(self, path):
+    def __init__(self, path, session=None):
         self._cli_path = path
-        self._bw_session = ""
+        self._bw_session = session or os.environ.get("BW_SESSION", "")
         try:
             check_output([self._cli_path, "--version"])
         except OSError:
@@ -88,38 +88,28 @@ class Bitwarden(object):
     @property
     def logged_in(self):
         # Parse Bitwarden status to check if logged in
-        if self.status() == 'unlocked':
-            return True
-        else:
-            return False
+        return self.status() == 'unlocked'
 
     def _run(self, args):
         my_env = os.environ.copy()
-        if self.session != "":
+        if self.session:
             my_env["BW_SESSION"] = self.session
-        p = Popen([self.cli_path] + args, stdin=PIPE,
-                  stdout=PIPE, stderr=STDOUT, env=my_env)
+        else:
+            raise AnsibleError("BW_SESSION is not set. Please set BW_SESSION and try again.")
+
+        # Verwende self._cli_path statt self.cli_path
+        p = Popen([self._cli_path] + args, stdin=PIPE, stdout=PIPE, stderr=STDOUT, env=my_env)
         out, _ = p.communicate()
         out = out.decode()
         rc = p.wait()
+
         if rc != 0:
-            display.debug("Received error when running '{0} {1}': {2}"
-                          .format(self.cli_path, args, out))
-            if out.startswith("Vault is locked."):
-                raise AnsibleError("Error accessing Bitwarden vault. "
-                                   "Run 'bw unlock' to unlock the vault.")
-            elif out.startswith("You are not logged in."):
-                raise AnsibleError("Error accessing Bitwarden vault. "
-                                   "Run 'bw login' to login.")
-            elif out.startswith("Failed to decrypt."):
-                raise AnsibleError("Error accessing Bitwarden vault. "
-                                   "Make sure BW_SESSION is set properly.")
-            elif out.startswith("Not found."):
-                raise AnsibleError("Error accessing Bitwarden vault. "
-                                   "Specified item not found: {}".format(args[-1]))
+            if "Vault is locked." in out:
+                raise AnsibleError("Error: Bitwarden vault is locked. Run 'bw unlock' and set BW_SESSION.")
+            elif "You are not logged in." in out:
+                raise AnsibleError("Error: Not logged in to Bitwarden. Run 'bw login'.")
             else:
-                raise AnsibleError("Unknown failure in 'bw' command: "
-                                   "{0}".format(out))
+                raise AnsibleError(f"Bitwarden CLI error: {out.strip()}")
         return out.strip()
 
     def sync(self):
@@ -128,9 +118,9 @@ class Bitwarden(object):
     def status(self):
         try:
             data = json.loads(self._run(['status']))
-        except json.decoder.JSONDecodeError as e:
-            raise AnsibleError("Error decoding Bitwarden status: %s" % e)
-        return data['status']
+            return data['status']
+        except json.JSONDecodeError as e:
+            raise AnsibleError(f"Error decoding Bitwarden status: {e}")
 
     def get_entry(self, key, field):
         return self._run(["get", field, key])
@@ -138,10 +128,12 @@ class Bitwarden(object):
     def get_notes(self, key):
         data = json.loads(self.get_entry(key, 'item'))
         return data['notes']
-
     def get_custom_field(self, key, field):
         data = json.loads(self.get_entry(key, 'item'))
-        return next(x for x in data['fields'] if x['name'] == field)['value']
+        for f in data.get('fields', []):
+            if f['name'] == field:
+                return f['value']
+        raise AnsibleError(f"Custom field '{field}' not found in item '{key}'.")
 
     def get_attachments(self, key, itemid, output):
         attachment = ['get', 'attachment', '{}'.format(
@@ -150,22 +142,19 @@ class Bitwarden(object):
 
 
 class LookupModule(LookupBase):
-
     def run(self, terms, variables=None, **kwargs):
-        bw = Bitwarden(path=kwargs.get('path', 'bw'))
+        session = kwargs.get('session')
+        bw = Bitwarden(path=kwargs.get('path', 'bw'), session=session)
 
         if not bw.logged_in:
-            raise AnsibleError("Not logged into Bitwarden: please run "
-                               "'bw login', or 'bw unlock' and set the "
-                               "BW_SESSION environment variable first")
+            raise AnsibleError("Not logged into Bitwarden. Please run 'bw login' or 'bw unlock' and set BW_SESSION.")
+
 
         field = kwargs.get('field', 'password')
         values = []
 
         if kwargs.get('sync'):
             bw.sync()
-        if kwargs.get('session'):
-            bw.session = kwargs.get('session')
 
         for term in terms:
             if kwargs.get('custom_field'):
